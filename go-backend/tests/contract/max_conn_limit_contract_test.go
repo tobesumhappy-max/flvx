@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -97,6 +98,7 @@ func TestMaxConnLimit(t *testing.T) {
 		"remoteAddr":    "1.1.1.1:443",
 		"strategy":      "fifo",
 		"maxConn":       42,
+		"ipMaxConn":     7,
 		"proxyProtocol": 2,
 	}
 	body, err := json.Marshal(payload)
@@ -195,8 +197,8 @@ func TestMaxConnLimit(t *testing.T) {
 		t.Fatalf("expected limiter name %s, got %v", expectedName, addData["name"])
 	}
 	if limits, ok := addData["limits"].([]interface{}); ok {
-		if len(limits) != 1 || limits[0] != "$ 42" {
-			t.Fatalf("expected limits to contain '$ 42', got %v", limits)
+		if len(limits) != 2 || limits[0] != "$ 42" || limits[1] != "$$ 7" {
+			t.Fatalf("expected limits to contain '$ 42' and '$$ 7', got %v", limits)
 		}
 	} else {
 		t.Fatalf("invalid limits type in AddCLimiters data: %v", addData)
@@ -218,8 +220,8 @@ func TestMaxConnLimit(t *testing.T) {
 		t.Fatalf("expected nested name %s, got %v", expectedName, nestedData["name"])
 	}
 	if nestedLimits, ok := nestedData["limits"].([]interface{}); ok {
-		if len(nestedLimits) != 1 || nestedLimits[0] != "$ 42" {
-			t.Fatalf("expected nested limits to contain '$ 42', got %v", nestedLimits)
+		if len(nestedLimits) != 2 || nestedLimits[0] != "$ 42" || nestedLimits[1] != "$$ 7" {
+			t.Fatalf("expected nested limits to contain '$ 42' and '$$ 7', got %v", nestedLimits)
 		}
 	} else {
 		t.Fatalf("invalid limits type in UpdateCLimiters nested data: %v", nestedData)
@@ -361,6 +363,143 @@ func TestUserMaxConnUpdateResyncsExistingForwards(t *testing.T) {
 	for _, service := range services {
 		if service["climiter"] != "user_conn_limit_2" {
 			t.Fatalf("expected service climiter user_conn_limit_2, got %v", service["climiter"])
+		}
+	}
+}
+
+func TestUserMaxConnWithPerIPRuleSplitsRuntimeLimiters(t *testing.T) {
+	secret := "contract-jwt-secret"
+	router, r := setupContractRouter(t, secret)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	userToken, err := auth.GenerateToken(3, "per_ip_user", 1, secret)
+	if err != nil {
+		t.Fatalf("generate user token: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO user(id, user, pwd, role_id, exp_time, flow, in_flow, out_flow, flow_reset_time, num, max_conn, created_time, updated_time, status)
+		VALUES(3, 'per_ip_user', 'pwd', 1, ?, 99999, 0, 0, 1, 10, 37, ?, ?, 1)
+	`, now+365*24*3600*1000, now, now).Error; err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO tunnel(id, name, traffic_ratio, type, protocol, flow, created_time, updated_time, status, in_ip, inx)
+		VALUES(11, 'user-per-ip-conn-tunnel', 1.0, 1, 'tls', 99999, ?, ?, 1, NULL, 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO node(id, name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(21, 'user-per-ip-conn-node', 'user-per-ip-conn-secret', '10.23.0.1', '10.23.0.1', '', '32300-32310', '', 'v1', 1, 1, 1, ?, ?, 1, '[::]', '[::]', 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol)
+		VALUES(11, 1, 21, 32301, 'round', 1, 'tls')
+	`).Error; err != nil {
+		t.Fatalf("insert chain_tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO user_tunnel(id, user_id, tunnel_id, num, flow, in_flow, out_flow, flow_reset_time, exp_time, status)
+		VALUES(31, 3, 11, 10, 99999, 0, 0, 1, ?, 1)
+	`, now+365*24*3600*1000).Error; err != nil {
+		t.Fatalf("insert user_tunnel: %v", err)
+	}
+
+	var commandMu sync.Mutex
+	receivedCommands := make([]string, 0)
+	addCLimitersData := make([]json.RawMessage, 0)
+	var updateServiceData json.RawMessage
+
+	stopNode := startMockSessionForMaxConn(t, server.URL, "user-per-ip-conn-secret", func(cmdType string, data json.RawMessage) (bool, string) {
+		commandMu.Lock()
+		defer commandMu.Unlock()
+		receivedCommands = append(receivedCommands, cmdType)
+		if cmdType == "AddCLimiters" {
+			addCLimitersData = append(addCLimitersData, append([]byte(nil), data...))
+		}
+		if cmdType == "UpdateService" {
+			updateServiceData = append([]byte(nil), data...)
+		}
+		return false, ""
+	})
+	defer stopNode()
+
+	waitNodeStatus(t, r, 21, 1)
+
+	payload := map[string]interface{}{
+		"name":       "user-per-ip-conn-forward",
+		"tunnelId":   int64(11),
+		"remoteAddr": "1.1.1.1:443",
+		"strategy":   "fifo",
+		"ipMaxConn":  7,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/forward/create", bytes.NewReader(body))
+	req.Header.Set("Authorization", userToken)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	var out response.R
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Code != 0 {
+		t.Fatalf("expected create success, got code=%d msg=%s", out.Code, out.Msg)
+	}
+
+	var forwardID int64
+	if err := r.DB().Raw("SELECT id FROM forward WHERE name = ?", "user-per-ip-conn-forward").Scan(&forwardID).Error; err != nil {
+		t.Fatalf("get forward ID: %v", err)
+	}
+	expectedRuleName := fmt.Sprintf("rule_conn_limit_%d", forwardID)
+
+	commandMu.Lock()
+	defer commandMu.Unlock()
+	if len(addCLimitersData) != 2 {
+		t.Fatalf("expected two AddCLimiters commands. Received: %v", receivedCommands)
+	}
+	if updateServiceData == nil {
+		t.Fatalf("expected UpdateService. Received: %v", receivedCommands)
+	}
+
+	gotLimits := make(map[string][]string)
+	for _, raw := range addCLimitersData {
+		var data map[string]interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			t.Fatalf("unmarshal AddCLimiters data: %v", err)
+		}
+		limits, ok := data["limits"].([]interface{})
+		if !ok {
+			t.Fatalf("expected limits array, got %T", data["limits"])
+		}
+		for _, limit := range limits {
+			gotLimits[fmt.Sprint(data["name"])] = append(gotLimits[fmt.Sprint(data["name"])], fmt.Sprint(limit))
+		}
+	}
+	if !reflect.DeepEqual(gotLimits["user_conn_limit_3"], []string{"$ 37"}) {
+		t.Fatalf("expected user max limiter payload, got %v", gotLimits["user_conn_limit_3"])
+	}
+	if !reflect.DeepEqual(gotLimits[expectedRuleName], []string{"$$ 7"}) {
+		t.Fatalf("expected rule per-IP limiter payload, got %v", gotLimits[expectedRuleName])
+	}
+
+	var services []map[string]interface{}
+	if err := json.Unmarshal(updateServiceData, &services); err != nil {
+		t.Fatalf("unmarshal UpdateService data: %v", err)
+	}
+	expectedCLimiter := "user_conn_limit_3," + expectedRuleName
+	for _, service := range services {
+		if service["climiter"] != expectedCLimiter {
+			t.Fatalf("expected service climiter %s, got %v", expectedCLimiter, service["climiter"])
 		}
 	}
 }

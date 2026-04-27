@@ -1764,6 +1764,18 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	if roleID != 0 {
+		if ipSpeedIDVal, ok := req["ipSpeedId"]; ok && ipSpeedIDVal != nil {
+			response.WriteJSON(w, response.Err(-1, "普通用户无法设置每 IP 限速规则"))
+			return
+		}
+	}
+	ipSpeedID := asAnyToInt64Ptr(req["ipSpeedId"])
+	ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
 	port := asInt(req["inPort"], 0)
 	if port <= 0 {
 		port = h.pickTunnelPort(tunnelID)
@@ -1802,9 +1814,13 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 		userName = "user"
 	}
 	maxConn := asInt(req["maxConn"], 0)
+	ipMaxConn := asInt(req["ipMaxConn"], 0)
+	if ipMaxConn < 0 {
+		ipMaxConn = 0
+	}
 	proxyProtocol := asInt(req["proxyProtocol"], 0)
 
-	forwardID, err := h.repo.CreateForwardTx(userID, userName, name, tunnelID, remoteAddr, defaultString(asString(req["strategy"]), "fifo"), now, inx, entryNodes, port, inIp, nullableInt(speedID), maxConn, proxyProtocol)
+	forwardID, err := h.repo.CreateForwardTx(userID, userName, name, tunnelID, remoteAddr, defaultString(asString(req["strategy"]), "fifo"), now, inx, entryNodes, port, inIp, nullableInt(speedID), maxConn, ipMaxConn, nullableInt(ipSpeedID), proxyProtocol)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -1903,6 +1919,27 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 	} else if _, ok := req["speedId"]; ok {
 		newSpeedID = sql.NullInt64{Valid: false}
 	}
+	rawIPSpeedID, hasIPSpeedID := req["ipSpeedId"]
+	requestedIPSpeedID := asAnyToInt64Ptr(rawIPSpeedID)
+	newIPSpeedID := forward.IPSpeedID
+	if actorRole != 0 {
+		if hasIPSpeedID && !sameSpeedLimitSelection(forward.IPSpeedID, requestedIPSpeedID) {
+			response.WriteJSON(w, response.Err(-1, "普通用户无法修改每 IP 限速规则"))
+			return
+		}
+	} else {
+		ipSpeedID := requestedIPSpeedID
+		ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
+		if err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+		if ipSpeedID != nil {
+			newIPSpeedID = sql.NullInt64{Int64: *ipSpeedID, Valid: true}
+		} else if hasIPSpeedID {
+			newIPSpeedID = sql.NullInt64{Valid: false}
+		}
+	}
 
 	port := asInt(req["inPort"], 0)
 	if port <= 0 {
@@ -1956,9 +1993,13 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UnixMilli()
 	maxConn := asInt(req["maxConn"], forward.MaxConn)
+	ipMaxConn := asInt(req["ipMaxConn"], forward.IPMaxConn)
+	if ipMaxConn < 0 {
+		ipMaxConn = 0
+	}
 	proxyProtocol := asInt(req["proxyProtocol"], forward.ProxyProtocol)
 
-	if err := h.repo.UpdateForward(id, name, tunnelID, remoteAddr, strategy, now, newSpeedID, maxConn, proxyProtocol); err != nil {
+	if err := h.repo.UpdateForward(id, name, tunnelID, remoteAddr, strategy, now, newSpeedID, maxConn, ipMaxConn, newIPSpeedID, proxyProtocol); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -4110,7 +4151,7 @@ func (h *Handler) rollbackForwardMutation(oldForward *forwardRecord, oldPorts []
 	h.repo.RollbackForwardFields(
 		oldForward.ID, oldForward.UserID, oldForward.UserName, oldForward.Name,
 		oldForward.TunnelID, oldForward.RemoteAddr, oldForward.Strategy, oldForward.Status,
-		oldForward.SpeedID, oldForward.MaxConn, oldForward.ProxyProtocol,
+		oldForward.SpeedID, oldForward.MaxConn, oldForward.IPMaxConn, oldForward.IPSpeedID, oldForward.ProxyProtocol,
 		time.Now().UnixMilli(),
 	)
 

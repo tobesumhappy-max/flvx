@@ -71,6 +71,9 @@ export interface ForwardApiItem {
   userId?: number;
   tunnelId?: number;
   speedId?: number | null;
+  ipMaxConn?: number;
+  ipSpeedId?: number | null;
+  ipSpeedLimitName?: string;
   maxConn?: number;
   proxyProtocol?: number;
   inx?: number;
@@ -372,6 +375,8 @@ export interface ForwardMutationPayload {
   remoteAddr?: string;
   strategy?: string;
   speedId?: number | null;
+  ipMaxConn?: number;
+  ipSpeedId?: number | null;
   maxConn?: number;
   proxyProtocol?: number;
 }

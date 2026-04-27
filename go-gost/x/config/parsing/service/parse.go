@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +30,6 @@ import (
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
 	selector_parser "github.com/go-gost/x/config/parsing/selector"
 	tls_util "github.com/go-gost/x/internal/util/tls"
-	xtraffic "github.com/go-gost/x/limiter/traffic"
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
@@ -185,20 +183,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 
 	var trafficLimiter listener.Option
 	if cfg.Limiter != "" {
-		lim := registry.TrafficLimiterRegistry().Get(cfg.Limiter)
-		if lim == nil {
-			// Try to parse as simple number (bandwidth in bytes/sec)
-			if val, err := strconv.Atoi(cfg.Limiter); err == nil && val > 0 {
-				lim = xtraffic.NewTrafficLimiter(
-					xtraffic.LimitsOption(fmt.Sprintf("%s %dB %dB", xtraffic.ServiceLimitKey, val, val)),
-				)
-			}
-			if lim == nil {
-				lim = xtraffic.NewTrafficLimiter(
-					xtraffic.LimitsOption(fmt.Sprintf("%s %s %s", xtraffic.ServiceLimitKey, cfg.Limiter, cfg.Limiter)),
-				)
-			}
-		}
+		lim := resolveTrafficLimiter(cfg.Limiter)
 		trafficLimiter = listener.TrafficLimiterOption(
 			cache_limiter.NewCachedTrafficLimiter(
 				lim,
@@ -216,7 +201,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		listener.AuthOption(auth_parser.Info(cfg.Listener.Auth)),
 		listener.TLSConfigOption(tlsConfig),
 		listener.AdmissionOption(xadmission.AdmissionGroup(admissions...)),
-		listener.ConnLimiterOption(registry.ConnLimiterRegistry().Get(cfg.CLimiter)),
+		listener.ConnLimiterOption(resolveConnLimiter(cfg.CLimiter)),
 		listener.ServiceOption(cfg.Name),
 		listener.ProxyProtocolOption(ppv),
 		listener.StatsOption(pStats),

@@ -27,6 +27,16 @@ type nodeRecord = model.NodeRecord
 
 type chainNodeRecord = model.ChainNodeRecord
 
+type forwardRuntimeLimiters struct {
+	TrafficLimiter string
+	ConnLimiter    string
+}
+
+type forwardLimiterConfig struct {
+	Name   string
+	Limits []string
+}
+
 type diagnosisTarget struct {
 	Address string
 	IP      string
@@ -264,6 +274,13 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		speed = utSpeed
 	}
 
+	var ipSpeed *int
+	if forward.IPSpeedID.Valid && forward.IPSpeedID.Int64 > 0 {
+		if speedVal, err := h.repo.GetSpeedLimitSpeed(forward.IPSpeedID.Int64); err == nil && speedVal > 0 {
+			ipSpeed = &speedVal
+		}
+	}
+
 	serviceBase := buildForwardServiceBaseWithResolvedUserTunnel(forward.ID, forward.UserID, userTunnelID)
 
 	user, err := h.repo.GetUserByID(forward.UserID)
@@ -271,19 +288,17 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		return nil, err
 	}
 
-	var cLimiterName string
-	var maxConnToSet int
-
-	if forward.MaxConn > 0 {
-		maxConnToSet = forward.MaxConn
-		cLimiterName = fmt.Sprintf("rule_conn_limit_%d", forward.ID)
-	} else if user != nil && user.MaxConn > 0 {
-		maxConnToSet = user.MaxConn
-		cLimiterName = fmt.Sprintf("user_conn_limit_%d", user.ID)
+	userMaxConn := 0
+	if user != nil && user.MaxConn > 0 {
+		userMaxConn = user.MaxConn
 	}
+	connLimiterConfigs := buildConnLimiterConfigs(forward, userMaxConn)
 
 	for _, fp := range ports {
+		runtimeLimiters := forwardRuntimeLimiters{ConnLimiter: joinLimiterNames(connLimiterConfigs)}
+		trafficLimiterNames := make([]string, 0, 2)
 		if limiterID != nil && speed != nil {
+			totalLimiterName := strconv.FormatInt(*limiterID, 10)
 			if err := h.ensureLimiterOnNode(fp.NodeID, *limiterID, *speed); err != nil {
 				// If the limiter push fails because the node is offline, skip it with a warning
 				if isNodeOfflineOrTimeoutError(err) {
@@ -297,10 +312,29 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 				}
 				return nil, err
 			}
+			trafficLimiterNames = append(trafficLimiterNames, totalLimiterName)
 		}
+		if ipSpeed != nil {
+			ruleLimiterName := fmt.Sprintf("rule_traffic_limit_%d", forward.ID)
+			if err := h.ensureTrafficLimiterOnNode(fp.NodeID, ruleLimiterName, nil, ipSpeed); err != nil {
+				// If the limiter push fails because the node is offline, skip it with a warning
+				if isNodeOfflineOrTimeoutError(err) {
+					node, _ := h.getNodeRecord(fp.NodeID)
+					nodeName := fmt.Sprintf("%d", fp.NodeID)
+					if node != nil && strings.TrimSpace(node.Name) != "" {
+						nodeName = strings.TrimSpace(node.Name)
+					}
+					warnings = append(warnings, fmt.Sprintf("节点 %s 不在线，已跳过下发", nodeName))
+					continue
+				}
+				return nil, err
+			}
+			trafficLimiterNames = append(trafficLimiterNames, ruleLimiterName)
+		}
+		runtimeLimiters.TrafficLimiter = strings.Join(trafficLimiterNames, ",")
 
-		if cLimiterName != "" {
-			if err := h.ensureConnLimiterOnNode(fp.NodeID, cLimiterName, maxConnToSet); err != nil {
+		for _, connLimiterConfig := range connLimiterConfigs {
+			if err := h.ensureConnLimiterOnNode(fp.NodeID, connLimiterConfig); err != nil {
 				warnings = append(warnings, fmt.Sprintf("节点 %d 连接限制器下发失败: %v", fp.NodeID, err))
 			}
 		}
@@ -309,7 +343,7 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		if err != nil {
 			return nil, err
 		}
-		services := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, strings.TrimSpace(fp.InIP), limiterID, cLimiterName)
+		services := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, strings.TrimSpace(fp.InIP), runtimeLimiters)
 		_, err = h.sendNodeCommand(node.ID, method, services, true, false)
 		if err != nil && allowFallbackAdd && method == "UpdateService" {
 			if isNotFoundError(err) {
@@ -324,7 +358,7 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		}
 		if err != nil && strings.EqualFold(strings.TrimSpace(method), "UpdateService") && isCannotAssignRequestedAddressError(err) {
 			var warning string
-			warning, err = h.fallbackForwardPortToDefaultBind(forward, tunnel, node, fp, serviceBase, limiterID, cLimiterName)
+			warning, err = h.fallbackForwardPortToDefaultBind(forward, tunnel, node, fp, serviceBase, runtimeLimiters)
 			if err == nil && warning != "" {
 				warnings = append(warnings, warning)
 			}
@@ -350,7 +384,7 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 	return warnings, nil
 }
 
-func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, fp forwardPortRecord, serviceBase string, limiterID *int64, cLimiterName string) (string, error) {
+func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, fp forwardPortRecord, serviceBase string, runtimeLimiters forwardRuntimeLimiters) (string, error) {
 	if h == nil || forward == nil || tunnel == nil || node == nil {
 		return "", errors.New("invalid bind fallback context")
 	}
@@ -367,7 +401,7 @@ func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunne
 	}
 
 	time.Sleep(150 * time.Millisecond)
-	defaultServices := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, "", limiterID, cLimiterName)
+	defaultServices := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, "", runtimeLimiters)
 	if _, err := h.sendNodeCommand(node.ID, "AddService", defaultServices, true, false); err != nil {
 		return "", err
 	}
@@ -1659,7 +1693,7 @@ func compactErrorMessage(msg string) string {
 	return strings.Join(strings.Fields(strings.ToLower(msg)), "")
 }
 
-func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, port int, bindIP string, limiterID *int64, cLimiterName string) []map[string]interface{} {
+func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, port int, bindIP string, runtimeLimiters forwardRuntimeLimiters) []map[string]interface{} {
 	protocols := []string{"tcp", "udp"}
 	services := make([]map[string]interface{}, 0, 2)
 	targets := splitRemoteTargets(forward.RemoteAddr)
@@ -1702,8 +1736,11 @@ func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel 
 				},
 			},
 		}
-		if cLimiterName != "" {
-			service["climiter"] = cLimiterName
+		if runtimeLimiters.ConnLimiter != "" {
+			service["climiter"] = runtimeLimiters.ConnLimiter
+		}
+		if runtimeLimiters.TrafficLimiter != "" {
+			service["limiter"] = runtimeLimiters.TrafficLimiter
 		}
 		if forward.ProxyProtocol > 0 {
 			handlerConfig := service["handler"].(map[string]interface{})
@@ -1727,9 +1764,6 @@ func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel 
 				service["metadata"] = map[string]interface{}{}
 			}
 			service["metadata"].(map[string]interface{})["interface"] = node.InterfaceName
-		}
-		if limiterID != nil && *limiterID > 0 {
-			service["limiter"] = strconv.FormatInt(*limiterID, 10)
 		}
 		services = append(services, service)
 	}
@@ -1830,22 +1864,16 @@ func (h *Handler) ensureLimiterOnNode(nodeID int64, limiterID int64, speed int) 
 	return nil
 }
 
-func (h *Handler) ensureConnLimiterOnNode(nodeID int64, limiterName string, maxConn int) error {
-	limitStr := fmt.Sprintf("$ %d", maxConn)
-
-	payload := map[string]interface{}{
-		"name":   limiterName,
-		"limits": []string{limitStr},
+func (h *Handler) ensureConnLimiterOnNode(nodeID int64, cfg forwardLimiterConfig) error {
+	if cfg.Name == "" || len(cfg.Limits) == 0 {
+		return nil
 	}
-
+	payload := map[string]interface{}{"name": cfg.Name, "limits": cfg.Limits}
 	if _, err := h.sendNodeCommand(nodeID, "AddCLimiters", payload, false, false); err != nil {
 		if !isAlreadyExistsMessage(err.Error()) {
 			return fmt.Errorf("连接限制器下发失败: %w", err)
 		}
-		updatePayload := map[string]interface{}{
-			"limiter": limiterName,
-			"data":    payload,
-		}
+		updatePayload := map[string]interface{}{"limiter": cfg.Name, "data": payload}
 		if _, updateErr := h.sendNodeCommand(nodeID, "UpdateCLimiters", updatePayload, false, false); updateErr != nil {
 			return fmt.Errorf("连接限制器更新失败: %w", updateErr)
 		}
@@ -1853,14 +1881,59 @@ func (h *Handler) ensureConnLimiterOnNode(nodeID int64, limiterName string, maxC
 	return nil
 }
 
-func buildLimiterAddPayload(limiterID int64, speed int) (string, map[string]interface{}) {
+func buildConnLimiterConfigs(forward *forwardRecord, userMaxConn int) []forwardLimiterConfig {
+	if forward == nil {
+		return nil
+	}
+	if forward.MaxConn > 0 {
+		limits := []string{fmt.Sprintf("$ %d", forward.MaxConn)}
+		if forward.IPMaxConn > 0 {
+			limits = append(limits, fmt.Sprintf("$$ %d", forward.IPMaxConn))
+		}
+		return []forwardLimiterConfig{{Name: fmt.Sprintf("rule_conn_limit_%d", forward.ID), Limits: limits}}
+	}
+	configs := make([]forwardLimiterConfig, 0, 2)
+	if userMaxConn > 0 {
+		configs = append(configs, forwardLimiterConfig{Name: fmt.Sprintf("user_conn_limit_%d", forward.UserID), Limits: []string{fmt.Sprintf("$ %d", userMaxConn)}})
+	}
+	if forward.IPMaxConn > 0 {
+		configs = append(configs, forwardLimiterConfig{Name: fmt.Sprintf("rule_conn_limit_%d", forward.ID), Limits: []string{fmt.Sprintf("$$ %d", forward.IPMaxConn)}})
+	}
+	return configs
+}
+
+func joinLimiterNames(configs []forwardLimiterConfig) string {
+	names := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		if cfg.Name != "" {
+			names = append(names, cfg.Name)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+func speedToLimitLine(key string, speed int) string {
 	rate := float64(speed) / 8.0
-	limitStr := fmt.Sprintf("$ %.1fMB %.1fMB", rate, rate)
+	return fmt.Sprintf("%s %.1fMB %.1fMB", key, rate, rate)
+}
+
+func buildTrafficLimiterPayload(name string, totalSpeed *int, ipSpeed *int) map[string]interface{} {
+	limits := make([]string, 0, 3)
+	if totalSpeed != nil && *totalSpeed > 0 {
+		limits = append(limits, speedToLimitLine("$", *totalSpeed))
+	}
+	if ipSpeed != nil && *ipSpeed > 0 {
+		limits = append(limits, speedToLimitLine("0.0.0.0/0", *ipSpeed), speedToLimitLine("::/0", *ipSpeed))
+	}
+	return map[string]interface{}{"name": name, "limits": limits}
+}
+
+func buildLimiterAddPayload(limiterID int64, speed int) (string, map[string]interface{}) {
 	name := strconv.FormatInt(limiterID, 10)
 
 	return name, map[string]interface{}{
 		"name":   name,
-		"limits": []string{limitStr},
+		"limits": []string{speedToLimitLine("$", speed)},
 	}
 }
 
@@ -1886,5 +1959,22 @@ func (h *Handler) upsertLimiterOnNode(nodeID int64, limiterID int64, speed int) 
 		}
 	}
 
+	return nil
+}
+
+func (h *Handler) ensureTrafficLimiterOnNode(nodeID int64, name string, totalSpeed *int, ipSpeed *int) error {
+	payload := buildTrafficLimiterPayload(name, totalSpeed, ipSpeed)
+	limits, _ := payload["limits"].([]string)
+	if name == "" || len(limits) == 0 {
+		return nil
+	}
+	if _, err := h.sendNodeCommand(nodeID, "AddLimiters", payload, false, false); err != nil {
+		if !isAlreadyExistsMessage(err.Error()) {
+			return fmt.Errorf("限速规则下发失败: %w", err)
+		}
+		if _, updateErr := h.sendNodeCommand(nodeID, "UpdateLimiters", buildLimiterUpdatePayload(name, payload), false, false); updateErr != nil {
+			return fmt.Errorf("限速规则更新失败: %w", updateErr)
+		}
+	}
 	return nil
 }

@@ -125,6 +125,9 @@ interface Forward {
   userId?: number;
   inx?: number;
   speedId?: number | null;
+  ipMaxConn?: number;
+  ipSpeedId?: number | null;
+  ipSpeedLimitName?: string;
   proxyProtocol?: number;
 }
 
@@ -160,6 +163,8 @@ interface ForwardForm {
   interfaceName?: string;
   strategy: string;
   speedId: number | null;
+  ipMaxConn?: number;
+  ipSpeedId: number | null;
   maxConn?: number;
   proxyProtocol?: number;
 }
@@ -577,6 +582,16 @@ const mapForwardApiItems = (items: ForwardApiItem[]): Forward[] => {
     speedId:
       typeof forward.speedId === "number" || forward.speedId === null
         ? forward.speedId
+        : undefined,
+    ipMaxConn:
+      typeof forward.ipMaxConn === "number" ? forward.ipMaxConn : undefined,
+    ipSpeedId:
+      typeof forward.ipSpeedId === "number" || forward.ipSpeedId === null
+        ? forward.ipSpeedId
+        : undefined,
+    ipSpeedLimitName:
+      typeof forward.ipSpeedLimitName === "string"
+        ? forward.ipSpeedLimitName
         : undefined,
     maxConn: typeof forward.maxConn === "number" ? forward.maxConn : undefined,
     proxyProtocol:
@@ -1316,6 +1331,8 @@ export default function ForwardPage() {
     interfaceName: "",
     strategy: "fifo",
     speedId: null,
+    ipMaxConn: 0,
+    ipSpeedId: null,
     maxConn: 0,
     proxyProtocol: 0,
   });
@@ -2030,6 +2047,7 @@ export default function ForwardPage() {
   };
 
   const selectedSpeedId = normalizeSpeedId(form.speedId);
+  const selectedIPSpeedId = normalizeSpeedId(form.ipSpeedId);
 
   const validateForm = (): boolean => {
     const newErrors: { [key: string]: string } = {};
@@ -2105,6 +2123,8 @@ export default function ForwardPage() {
       interfaceName: "",
       strategy: "fifo",
       speedId: null,
+      ipMaxConn: 0,
+      ipSpeedId: null,
       proxyProtocol: 0,
     });
     setErrors({});
@@ -2126,6 +2146,8 @@ export default function ForwardPage() {
       interfaceName: forward.interfaceName || "",
       strategy: forward.strategy || "fifo",
       speedId: normalizeSpeedId(forward.speedId),
+      ipMaxConn: forward.ipMaxConn ?? 0,
+      ipSpeedId: normalizeSpeedId(forward.ipSpeedId),
       maxConn: forward.maxConn ?? 0,
       proxyProtocol: forward.proxyProtocol ?? 0,
     });
@@ -2245,6 +2267,8 @@ export default function ForwardPage() {
       let res: { code: number; msg: string };
       const normalizedSpeedId = normalizeSpeedId(form.speedId);
       const speedLimitAutoCleared = isMissingSpeedLimit(form.speedId);
+      const normalizedIPSpeedId = normalizeSpeedId(form.ipSpeedId);
+      const ipSpeedLimitAutoCleared = isMissingSpeedLimit(form.ipSpeedId);
 
       if (isEdit) {
         const updateData = {
@@ -2256,6 +2280,8 @@ export default function ForwardPage() {
           remoteAddr: processedRemoteAddr,
           strategy: addressCount > 1 ? form.strategy : "fifo",
           speedId: normalizedSpeedId,
+          ipMaxConn: form.ipMaxConn,
+          ...(isAdmin ? { ipSpeedId: normalizedIPSpeedId } : {}),
           maxConn: form.maxConn,
           proxyProtocol: form.proxyProtocol,
         };
@@ -2270,6 +2296,8 @@ export default function ForwardPage() {
           remoteAddr: processedRemoteAddr,
           strategy: addressCount > 1 ? form.strategy : "fifo",
           speedId: normalizedSpeedId,
+          ipMaxConn: form.ipMaxConn,
+          ...(isAdmin ? { ipSpeedId: normalizedIPSpeedId } : {}),
           maxConn: form.maxConn,
           proxyProtocol: form.proxyProtocol,
         };
@@ -2293,6 +2321,12 @@ export default function ForwardPage() {
         });
         if (speedLimitAutoCleared) {
           toast("所选限速规则不存在，已自动清除为不限速", {
+            icon: "⚠️",
+            duration: 5000,
+          });
+        }
+        if (isAdmin && ipSpeedLimitAutoCleared) {
+          toast("所选每 IP 限速规则不存在，已自动清除为不限速", {
             icon: "⚠️",
             duration: 5000,
           });
@@ -4911,6 +4945,27 @@ export default function ForwardPage() {
                             setForm((prev) => ({ ...prev, maxConn: value }));
                           }}
                         />
+                        <Input
+                          description="每个客户端 IP 可同时建立的最大连接数；0 或空表示不限制。"
+                          label="每 IP 最大连接数"
+                          min="0"
+                          placeholder="0 或空表示不限制"
+                          type="number"
+                          value={
+                            form.ipMaxConn === 0
+                              ? ""
+                              : String(form.ipMaxConn || "")
+                          }
+                          variant="bordered"
+                          onChange={(e) => {
+                            const value = Math.max(
+                              Number(e.target.value) || 0,
+                              0,
+                            );
+
+                            setForm((prev) => ({ ...prev, ipMaxConn: value }));
+                          }}
+                        />
                         <Select
                           description="启用 PROXY protocol，用于透传客户端真实 IP"
                           label="Proxy Protocol"
@@ -4948,6 +5003,40 @@ export default function ForwardPage() {
                               setForm((prev) => ({
                                 ...prev,
                                 speedId: selectedKey
+                                  ? Number(selectedKey)
+                                  : null,
+                              }));
+                            }}
+                          >
+                            {availableSpeedLimits.map((speedLimit) => (
+                              <SelectItem
+                                key={speedLimit.id.toString()}
+                                textValue={speedLimit.name}
+                              >
+                                {speedLimit.name}
+                              </SelectItem>
+                            ))}
+                          </Select>
+                        )}
+                        {isAdmin && (
+                          <Select
+                            description="每个客户端 IP 独享该限速规则；不选择表示不限制。"
+                            label="每 IP 限速"
+                            placeholder="不限速"
+                            selectedKeys={
+                              selectedIPSpeedId !== null
+                                ? [selectedIPSpeedId.toString()]
+                                : []
+                            }
+                            variant="bordered"
+                            onSelectionChange={(keys) => {
+                              const selectedKey = Array.from(keys)[0] as
+                                | string
+                                | undefined;
+
+                              setForm((prev) => ({
+                                ...prev,
+                                ipSpeedId: selectedKey
                                   ? Number(selectedKey)
                                   : null,
                               }));

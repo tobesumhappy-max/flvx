@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestBuildForwardServiceConfigsSendsProxyProtocolToForwardHandler(t *testing
 		UDPListenAddr: "0.0.0.0",
 	}
 
-	services := buildForwardServiceConfigs("1_2_3", forward, tunnel, node, 4001, "", nil, "")
+	services := buildForwardServiceConfigs("1_2_3", forward, tunnel, node, 4001, "", forwardRuntimeLimiters{})
 	if len(services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(services))
 	}
@@ -73,6 +74,8 @@ func TestRollbackForwardMutationRestoresProxyProtocol(t *testing.T) {
 		CreatedTime:   now,
 		UpdatedTime:   now,
 		Status:        1,
+		IPMaxConn:     5,
+		IPSpeedID:     sql.NullInt64{Int64: 21, Valid: true},
 		ProxyProtocol: 2,
 	}).Error; err != nil {
 		t.Fatalf("create forward: %v", err)
@@ -81,6 +84,8 @@ func TestRollbackForwardMutationRestoresProxyProtocol(t *testing.T) {
 	forwardID := mustLastInsertID(t, r, "rollback-forward")
 	if err := r.DB().Model(&model.Forward{}).Where("id = ?", forwardID).Updates(map[string]interface{}{
 		"name":           "changed-forward",
+		"ip_max_conn":    0,
+		"ip_speed_id":    nil,
 		"proxy_protocol": 0,
 		"updated_time":   now + 1,
 	}).Error; err != nil {
@@ -97,14 +102,22 @@ func TestRollbackForwardMutationRestoresProxyProtocol(t *testing.T) {
 		RemoteAddr:    "9.9.9.9:443",
 		Strategy:      "fifo",
 		Status:        1,
+		IPMaxConn:     5,
+		IPSpeedID:     sql.NullInt64{Int64: 21, Valid: true},
 		ProxyProtocol: 2,
 	}, nil)
 
-	var proxyProtocol int
-	if err := r.DB().Raw("SELECT proxy_protocol FROM forward WHERE id = ?", forwardID).Row().Scan(&proxyProtocol); err != nil {
-		t.Fatalf("query proxy_protocol: %v", err)
+	var record model.Forward
+	if err := r.DB().Where("id = ?", forwardID).First(&record).Error; err != nil {
+		t.Fatalf("query forward: %v", err)
 	}
-	if proxyProtocol != 2 {
-		t.Fatalf("expected proxyProtocol restored to 2, got %d", proxyProtocol)
+	if record.ProxyProtocol != 2 {
+		t.Fatalf("expected proxyProtocol restored to 2, got %d", record.ProxyProtocol)
+	}
+	if record.IPMaxConn != 5 {
+		t.Fatalf("expected ipMaxConn restored to 5, got %d", record.IPMaxConn)
+	}
+	if !record.IPSpeedID.Valid || record.IPSpeedID.Int64 != 21 {
+		t.Fatalf("expected ipSpeedId restored to 21, got %+v", record.IPSpeedID)
 	}
 }
