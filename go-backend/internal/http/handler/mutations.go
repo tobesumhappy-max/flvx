@@ -1921,21 +1921,24 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	rawIPSpeedID, hasIPSpeedID := req["ipSpeedId"]
 	requestedIPSpeedID := asAnyToInt64Ptr(rawIPSpeedID)
-	if actorRole != 0 && hasIPSpeedID && requestedIPSpeedID != nil && !sameSpeedLimitSelection(forward.IPSpeedID, requestedIPSpeedID) {
-		response.WriteJSON(w, response.Err(-1, "普通用户无法修改每 IP 限速规则"))
-		return
-	}
-	ipSpeedID := requestedIPSpeedID
-	ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
-	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
-		return
-	}
 	newIPSpeedID := forward.IPSpeedID
-	if ipSpeedID != nil {
-		newIPSpeedID = sql.NullInt64{Int64: *ipSpeedID, Valid: true}
-	} else if _, ok := req["ipSpeedId"]; ok {
-		newIPSpeedID = sql.NullInt64{Valid: false}
+	if actorRole != 0 {
+		if hasIPSpeedID && !sameSpeedLimitSelection(forward.IPSpeedID, requestedIPSpeedID) {
+			response.WriteJSON(w, response.Err(-1, "普通用户无法修改每 IP 限速规则"))
+			return
+		}
+	} else {
+		ipSpeedID := requestedIPSpeedID
+		ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
+		if err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+		if ipSpeedID != nil {
+			newIPSpeedID = sql.NullInt64{Int64: *ipSpeedID, Valid: true}
+		} else if hasIPSpeedID {
+			newIPSpeedID = sql.NullInt64{Valid: false}
+		}
 	}
 
 	port := asInt(req["inPort"], 0)
