@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"go-backend/internal/store/model"
@@ -135,7 +136,67 @@ func parseTunnelProbeTargetFromRequest(req map[string]interface{}) (tunnelProbeT
 	if req == nil {
 		return defaultTunnelProbeTarget(), false, nil
 	}
-	return normalizeTunnelProbeTarget(asString(req["probeTargetHost"]), asInt(req["probeTargetPort"], 0))
+	rawHost, hasHost := req["probeTargetHost"]
+	rawPort, hasPort := req["probeTargetPort"]
+	if !hasHost && !hasPort {
+		return defaultTunnelProbeTarget(), false, nil
+	}
+	host, err := parseTunnelProbeTargetHostValue(rawHost)
+	if err != nil {
+		return tunnelProbeTarget{}, false, err
+	}
+	port, err := parseTunnelProbeTargetPortValue(rawPort)
+	if err != nil {
+		return tunnelProbeTarget{}, false, err
+	}
+	return normalizeTunnelProbeTarget(host, port)
+}
+
+func parseTunnelProbeTargetHostValue(raw interface{}) (string, error) {
+	if raw == nil {
+		return "", nil
+	}
+	host, ok := raw.(string)
+	if !ok {
+		return "", errors.New("测试目标 Host 格式无效")
+	}
+	if host != strings.TrimSpace(host) {
+		return "", errors.New("测试目标 Host 不能包含协议或路径")
+	}
+	return host, nil
+}
+
+func parseTunnelProbeTargetPortValue(raw interface{}) (int, error) {
+	if raw == nil {
+		return 0, nil
+	}
+	switch v := raw.(type) {
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, errors.New("测试目标端口必须是整数")
+		}
+		return int(v), nil
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		if v != strings.TrimSpace(v) {
+			return 0, errors.New("测试目标端口必须是整数")
+		}
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, errors.New("测试目标端口必须是整数")
+		}
+		return port, nil
+	case int:
+		return v, nil
+	case int32:
+		return int(v), nil
+	case int64:
+		return int(v), nil
+	default:
+		return 0, errors.New("测试目标端口必须是整数")
+	}
 }
 
 func effectiveTunnelProbeTarget(tunnel *model.Tunnel) tunnelProbeTarget {

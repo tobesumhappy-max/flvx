@@ -101,6 +101,53 @@ func TestTunnelUpdateWithoutProbeTargetFieldsPreservesExistingTarget(t *testing.
 	}
 }
 
+func TestTunnelUpdateRejectsInvalidProbeTargetWithoutClearingExistingTarget(t *testing.T) {
+	tests := []struct {
+		name        string
+		probeFields string
+	}{
+		{name: "non numeric port", probeFields: `,"probeTargetPort":"abc"`},
+		{name: "fractional port", probeFields: `,"probeTargetPort":443.5`},
+		{name: "whitespace host", probeFields: `,"probeTargetHost":"   "`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := setupProbeTargetTunnelHandler(t)
+			seedProbeTargetTunnel(t, h, 80, "existing", "old.example.com", 9443)
+			body := bytes.NewReader([]byte(`{
+				"id":80,
+				"name":"existing",
+				"type":1,
+				"flow":1,
+				"trafficRatio":1,
+				"status":1,
+				"inNodeId":[{"nodeId":10,"protocol":"tls"}]
+			` + tt.probeFields + `}`))
+
+			res := httptest.NewRecorder()
+			h.tunnelUpdate(res, httptest.NewRequest(http.MethodPost, "/api/v1/tunnel/update", body))
+			var payload struct {
+				Code int    `json:"code"`
+				Msg  string `json:"msg"`
+			}
+			decodeProbeTargetResponse(t, res, &payload)
+			if payload.Code == 0 || payload.Msg == "" {
+				t.Fatalf("expected validation failure, got %+v", payload)
+			}
+
+			items, err := h.repo.ListTunnels()
+			if err != nil {
+				t.Fatalf("list tunnels: %v", err)
+			}
+			item := findProbeTargetTunnelItem(t, items, 80)
+			if item["probeTargetHost"] != "old.example.com" || item["probeTargetPort"] != 9443 {
+				t.Fatalf("expected invalid probe target to preserve existing target, got %+v", item)
+			}
+		})
+	}
+}
+
 func TestTunnelCreateRejectsInvalidProbeTarget(t *testing.T) {
 	h := setupProbeTargetTunnelHandler(t)
 	body := bytes.NewReader([]byte(`{
