@@ -157,17 +157,19 @@ export const validateTunnelForm = (
     errors.trafficRatio = "流量倍率须大于0，支持小数（如 0.5）";
   }
 
-  const probeHost = (form.probeTargetHost || "").trim();
+  const rawProbeHost = form.probeTargetHost || "";
+  const probeHost = rawProbeHost.trim();
   const probePortInput = form.probeTargetPort;
   const probePort = Number(probePortInput ?? 0);
+  const hasProbeHostInput = rawProbeHost.length > 0;
   const hasProbePort = probePortInput != null && probePortInput !== 0;
 
-  if (probeHost || hasProbePort) {
+  if (hasProbeHostInput || hasProbePort) {
     if (!probeHost) {
       errors.probeTargetHost = "请输入测试目标 Host";
     } else if (
       probeHost.includes("://") ||
-      /[\s/?#]/.test(probeHost) ||
+      /[\s/?#]/.test(rawProbeHost) ||
       isSchemeLikeProbeHost(probeHost)
     ) {
       errors.probeTargetHost = "Host 不能包含协议、端口、空格或路径";
