@@ -119,18 +119,20 @@ type StatisticsFlow struct {
 func (StatisticsFlow) TableName() string { return "statistics_flow" }
 
 type Tunnel struct {
-	ID           int64          `gorm:"primaryKey;autoIncrement"`
-	Name         string         `gorm:"type:varchar(100);not null"`
-	TrafficRatio float64        `gorm:"column:traffic_ratio;not null;default:1.0"`
-	Type         int            `gorm:"not null"`
-	Protocol     string         `gorm:"type:varchar(10);not null;default:'tls'"`
-	Flow         int64          `gorm:"not null"`
-	CreatedTime  int64          `gorm:"column:created_time;not null"`
-	UpdatedTime  int64          `gorm:"column:updated_time;not null"`
-	Status       int            `gorm:"not null"`
-	InIP         sql.NullString `gorm:"column:in_ip;type:text"`
-	Inx          int            `gorm:"not null;default:0"`
-	IPPreference string         `gorm:"column:ip_preference;type:varchar(10);not null;default:''"`
+	ID              int64          `gorm:"primaryKey;autoIncrement"`
+	Name            string         `gorm:"type:varchar(100);not null"`
+	TrafficRatio    float64        `gorm:"column:traffic_ratio;not null;default:1.0"`
+	Type            int            `gorm:"not null"`
+	Protocol        string         `gorm:"type:varchar(10);not null;default:'tls'"`
+	Flow            int64          `gorm:"not null"`
+	CreatedTime     int64          `gorm:"column:created_time;not null"`
+	UpdatedTime     int64          `gorm:"column:updated_time;not null"`
+	Status          int            `gorm:"not null"`
+	InIP            sql.NullString `gorm:"column:in_ip;type:text"`
+	Inx             int            `gorm:"not null;default:0"`
+	IPPreference    string         `gorm:"column:ip_preference;type:varchar(10);not null;default:''"`
+	ProbeTargetHost string         `gorm:"column:probe_target_host;type:text;not null;default:''"`
+	ProbeTargetPort int            `gorm:"column:probe_target_port;not null;default:0"`
 }
 
 func (Tunnel) TableName() string { return "tunnel" }

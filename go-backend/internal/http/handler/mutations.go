@@ -607,6 +607,17 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 	trafficRatio := asFloat(req["trafficRatio"], 1.0)
 	inIP := asString(req["inIp"])
 	ipPreference := asString(req["ipPreference"])
+	probeTarget, probeTargetConfigured, err := parseTunnelProbeTargetFromRequest(req)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	probeTargetHost := ""
+	probeTargetPort := 0
+	if probeTargetConfigured {
+		probeTargetHost = probeTarget.Host
+		probeTargetPort = probeTarget.Port
+	}
 	now := time.Now().UnixMilli()
 	inx := h.repo.NextIndex("tunnel")
 	localDomain := h.federationLocalDomain()
@@ -685,17 +696,19 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 		tunnelProtocol = strings.TrimSpace(runtimeState.InNodes[0].Protocol)
 	}
 	tunnel := model.Tunnel{
-		Name:         name,
-		TrafficRatio: trafficRatio,
-		Type:         typeVal,
-		Protocol:     tunnelProtocol,
-		Flow:         flow,
-		CreatedTime:  now,
-		UpdatedTime:  now,
-		Status:       status,
-		InIP:         tunnelInIP,
-		Inx:          inx,
-		IPPreference: ipPreference,
+		Name:            name,
+		TrafficRatio:    trafficRatio,
+		Type:            typeVal,
+		Protocol:        tunnelProtocol,
+		Flow:            flow,
+		CreatedTime:     now,
+		UpdatedTime:     now,
+		Status:          status,
+		InIP:            tunnelInIP,
+		Inx:             inx,
+		IPPreference:    ipPreference,
+		ProbeTargetHost: probeTargetHost,
+		ProbeTargetPort: probeTargetPort,
 	}
 	if err := tx.Create(&tunnel).Error; err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
@@ -882,6 +895,17 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UnixMilli()
 	ipPreference := asString(req["ipPreference"])
+	probeTarget, probeTargetConfigured, err := parseTunnelProbeTargetFromRequest(req)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	probeTargetHost := ""
+	probeTargetPort := 0
+	if probeTargetConfigured {
+		probeTargetHost = probeTarget.Host
+		probeTargetPort = probeTarget.Port
+	}
 	localDomain := h.federationLocalDomain()
 
 	runtimeState, err := h.prepareTunnelCreateState(h.repo.DB(), req, typeVal, id)
@@ -928,6 +952,8 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 		inIp,
 		ipPreference,
 		updateProtocol,
+		probeTargetHost,
+		probeTargetPort,
 		now,
 	); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))

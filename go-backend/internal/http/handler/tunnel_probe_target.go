@@ -142,7 +142,7 @@ func effectiveTunnelProbeTarget(tunnel *model.Tunnel) tunnelProbeTarget {
 	if tunnel == nil {
 		return defaultTunnelProbeTarget()
 	}
-	return defaultTunnelProbeTarget()
+	return effectiveTunnelProbeTargetValues(tunnel.ProbeTargetHost, tunnel.ProbeTargetPort)
 }
 
 func effectiveTunnelProbeTargetValues(host string, port int) tunnelProbeTarget {
