@@ -26,6 +26,9 @@ const isValidProbeIPv4 = (host: string) => {
       if (!/^\d+$/.test(part)) {
         return false;
       }
+      if (part.length > 1 && part.startsWith("0")) {
+        return false;
+      }
 
       const value = Number(part);
 
