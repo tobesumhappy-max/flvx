@@ -74,6 +74,7 @@ type Server struct {
 	upgrader     websocket.Upgrader
 	onNodeOnline func(nodeID int64)
 	onNodeMetric func(nodeID int64, info SystemInfo)
+	getUserAuthState func(userID int64) (*auth.UserAuthState, error)
 
 	mu      sync.RWMutex
 	admins  map[*connWrap]struct{}
@@ -130,6 +131,15 @@ func NewServer(repo *repo.Repository, jwtSecret string) *Server {
 	}
 }
 
+func (s *Server) SetUserAuthStateLookup(fn func(userID int64) (*auth.UserAuthState, error)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.getUserAuthState = fn
+	s.mu.Unlock()
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	typeVal := query.Get("type")
@@ -146,9 +156,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if typeVal == "0" {
-		if _, ok := auth.ValidateToken(secret, s.jwtSecret); !ok {
+		claims, ok := auth.ValidateToken(secret, s.jwtSecret)
+		if !ok {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
+		}
+		if s.getUserAuthState != nil {
+			userID, err := strconv.ParseInt(claims.Sub, 10, 64)
+			if err != nil {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			state, err := s.getUserAuthState(userID)
+			if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || claims.IatMs <= state.PasswordChangedAt {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
 		}
 		s.handleAdmin(w, r)
 		return

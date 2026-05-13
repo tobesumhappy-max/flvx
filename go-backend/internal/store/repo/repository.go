@@ -486,9 +486,10 @@ func (r *Repository) UpdateUserNameAndPassword(userID int64, username, passwordM
 		return errors.New("repository not initialized")
 	}
 	return r.db.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]interface{}{
-		"user":         username,
-		"pwd":          passwordMD5,
-		"updated_time": now,
+		"user":                username,
+		"pwd":                 passwordMD5,
+		"password_changed_at": now,
+		"updated_time":        now,
 	}).Error
 }
 
@@ -1890,7 +1891,7 @@ func (r *Repository) ExportAll() (*model.BackupData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("export configs failed: %w", err)
 	}
-	backup.Configs = configs
+	backup.Configs = FilterSensitiveConfigs(configs)
 
 	return backup, nil
 }
@@ -1970,7 +1971,7 @@ func (r *Repository) ExportPartial(types []string) (*model.BackupData, error) {
 		if err != nil {
 			return nil, fmt.Errorf("export configs failed: %w", err)
 		}
-		backup.Configs = v
+		backup.Configs = FilterSensitiveConfigs(v)
 	}
 	return backup, nil
 }
@@ -2726,6 +2727,7 @@ func importPermissions(tx *gorm.DB, permissions []model.PermissionBackup, _ int6
 }
 
 func importConfigs(tx *gorm.DB, configs map[string]string, now int64) (int, error) {
+	configs = FilterSensitiveConfigs(configs)
 	count := 0
 	for name, value := range configs {
 		err := tx.Clauses(clause.OnConflict{

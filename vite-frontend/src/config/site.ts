@@ -1,4 +1,5 @@
-import { getConfigByName, getConfigs } from "@/api";
+import { getConfigByName, getConfigs, getPublicConfigByName } from "@/api";
+import { isLoggedIn } from "@/utils/auth";
 
 export type SiteConfig = typeof siteConfig;
 
@@ -8,8 +9,57 @@ const VERSION = import.meta.env.VITE_APP_VERSION || "dev";
 const APP_VERSION = "1.0.3";
 const DEFAULT_FAVICON = "/favicon.ico";
 const FAVICON_LINK_ID = "app-favicon";
+const PUBLIC_BRAND_CONFIG_KEYS = [
+  "app_name",
+  "app_logo",
+  "app_favicon",
+  "app_bg_image",
+] as const;
 const GITHUB_REPO =
   import.meta.env.VITE_GITHUB_REPO || "https://github.com/Sagit-chu/flux-panel";
+
+const readCachedConfigs = (keys: readonly string[]) => {
+  const cachedConfigs: Record<string, string> = {};
+  let hasCachedData = false;
+
+  keys.forEach((key) => {
+    const cachedValue = configCache.get(key);
+
+    if (cachedValue !== null) {
+      cachedConfigs[key] = cachedValue;
+      hasCachedData = true;
+    }
+  });
+
+  return { cachedConfigs, hasCachedData };
+};
+
+const fetchPublicBrandConfigs = async (): Promise<Record<string, string>> => {
+  const publicConfigMap: Record<string, string> = {};
+
+  await Promise.all(
+    PUBLIC_BRAND_CONFIG_KEYS.map(async (key) => {
+      try {
+        const response = await getPublicConfigByName(key);
+
+        if (
+          response.code === 0 &&
+          response.data &&
+          typeof response.data.value === "string"
+        ) {
+          const value = response.data.value;
+
+          publicConfigMap[key] = value;
+          configCache.set(key, value);
+        }
+      } catch {
+        // ignore single key fetch error
+      }
+    }),
+  );
+
+  return publicConfigMap;
+};
 
 const getInitialConfig = () => {
   if (typeof window === "undefined") {
@@ -129,46 +179,19 @@ export const getCachedConfig = async (key: string): Promise<string | null> => {
 
 // 获取所有配置（优先从缓存）
 export const getCachedConfigs = async (): Promise<Record<string, string>> => {
-  // 尝试从缓存获取所有配置
-  const configKeys = ["app_name", "app_logo", "app_favicon", "app_bg_image"];
-  const cachedConfigs: Record<string, string> = {};
-  let hasCachedData = false;
+  const { cachedConfigs, hasCachedData } = readCachedConfigs(
+    PUBLIC_BRAND_CONFIG_KEYS,
+  );
 
-  configKeys.forEach((key) => {
-    const cachedValue = configCache.get(key);
+  if (!isLoggedIn()) {
+    const publicConfigs = await fetchPublicBrandConfigs();
 
-    if (cachedValue !== null) {
-      cachedConfigs[key] = cachedValue;
-      hasCachedData = true;
+    if (Object.keys(publicConfigs).length > 0) {
+      return { ...cachedConfigs, ...publicConfigs };
     }
-  });
 
-  const fetchPublicConfigs = async (): Promise<Record<string, string>> => {
-    const publicConfigMap: Record<string, string> = {};
-
-    await Promise.all(
-      configKeys.map(async (key) => {
-        try {
-          const response = await getConfigByName(key);
-
-          if (
-            response.code === 0 &&
-            response.data &&
-            typeof response.data.value === "string"
-          ) {
-            const value = response.data.value;
-
-            publicConfigMap[key] = value;
-            configCache.set(key, value);
-          }
-        } catch {
-          // ignore single key fetch error
-        }
-      }),
-    );
-
-    return publicConfigMap;
-  };
+    return cachedConfigs;
+  }
 
   // 从API获取最新配置
   try {
@@ -189,14 +212,14 @@ export const getCachedConfigs = async (): Promise<Record<string, string>> => {
       return cachedConfigs;
     }
 
-    return await fetchPublicConfigs();
+    return await fetchPublicBrandConfigs();
   } catch {
     // API失败时返回缓存的数据
     if (hasCachedData) {
       return cachedConfigs;
     }
 
-    return await fetchPublicConfigs();
+    return await fetchPublicBrandConfigs();
   }
 };
 
