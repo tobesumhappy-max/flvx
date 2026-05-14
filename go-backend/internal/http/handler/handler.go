@@ -984,6 +984,10 @@ func (h *Handler) updateConfigs(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			continue
 		}
+		if repo.IsSensitiveConfigKey(key) {
+			response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+			return
+		}
 
 		if protectedKeys[key] && isCommercial != "true" {
 			response.WriteJSON(w, response.ErrDefault("需要商业版授权"))
@@ -1019,6 +1023,10 @@ func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
+		return
+	}
+	if repo.IsSensitiveConfigKey(name) {
+		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
 		return
 	}
 
