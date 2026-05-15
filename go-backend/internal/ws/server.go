@@ -30,22 +30,23 @@ type broadcastMessage struct {
 	Data string `json:"data"`
 }
 
-type connWrap struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
-}
-
 type nodeSession struct {
 	nodeID int64
 	secret string
-	conn   *connWrap
+	conn   *websocket.Conn
 	crypto *security.AESCrypto // 缓存的 AES 加密器，避免每条消息重建
 }
 
 type adminSession struct {
 	userID int64
 	claims auth.Claims
-	conn   *connWrap
+	conn   *websocket.Conn
+}
+
+type monitorSession struct {
+	userID int64
+	claims auth.Claims
+	conn   *websocket.Conn
 }
 
 type commandResponse struct {
@@ -83,10 +84,11 @@ type Server struct {
 	getUserAuthState func(userID int64) (*auth.UserAuthState, error)
 
 	mu      sync.RWMutex
-	admins  map[*adminSession]struct{}
-	nodes   map[int64]*nodeSession
-	byConn  map[*websocket.Conn]*nodeSession
-	pending map[string]pendingRequest
+	admins   map[*adminSession]struct{}
+	monitors map[*monitorSession]struct{}
+	nodes    map[int64]*nodeSession
+	byConn   map[*websocket.Conn]*nodeSession
+	pending  map[string]pendingRequest
 }
 
 type SystemInfo struct {
@@ -130,10 +132,11 @@ func NewServer(repo *repo.Repository, jwtSecret string) *Server {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		admins:  make(map[*adminSession]struct{}),
-		nodes:   make(map[int64]*nodeSession),
-		byConn:  make(map[*websocket.Conn]*nodeSession),
-		pending: make(map[string]pendingRequest),
+		admins:   make(map[*adminSession]struct{}),
+		monitors: make(map[*monitorSession]struct{}),
+		nodes:    make(map[int64]*nodeSession),
+		byConn:   make(map[*websocket.Conn]*nodeSession),
+		pending:  make(map[string]pendingRequest),
 	}
 }
 
@@ -172,15 +175,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if claims.RoleID != 0 {
+		if claims.RoleID == 0 {
+			if !s.validateAdminSession(userID, claims) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			s.handleAdmin(w, r, userID, claims)
+			return
+		}
+		if !s.validateMonitorSession(userID, claims) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if !s.validateAdminSession(userID, claims) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		s.handleAdmin(w, r, userID, claims)
+		s.handleMonitor(w, r, userID, claims)
 		return
 	}
 
@@ -192,14 +199,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, userID int6
 	if err != nil {
 		return
 	}
-	cw := &connWrap{conn: conn}
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	})
 	done := make(chan struct{})
-	session := &adminSession{userID: userID, claims: claims, conn: cw}
-	go startKeepalive(cw, done, func() bool {
+	session := &adminSession{userID: userID, claims: claims, conn: conn}
+	go startKeepalive(conn, done, func() bool {
 		return s.validateAdminSession(session.userID, session.claims)
 	})
 
@@ -222,18 +228,51 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, userID int6
 	}
 }
 
-func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64, secret string) {
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request, userID int64, claims auth.Claims) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	cw := &connWrap{conn: conn}
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	})
 	done := make(chan struct{})
-	go startKeepalive(cw, done, nil)
+	session := &monitorSession{userID: userID, claims: claims, conn: conn}
+	go startKeepalive(conn, done, func() bool {
+		return s.validateMonitorSession(session.userID, session.claims)
+	})
+
+	s.mu.Lock()
+	s.monitors[session] = struct{}{}
+	s.mu.Unlock()
+
+	defer func() {
+		close(done)
+		s.mu.Lock()
+		delete(s.monitors, session)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64, secret string) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+	done := make(chan struct{})
+	go startKeepalive(conn, done, nil)
 
 	version := r.URL.Query().Get("version")
 	httpVal := parseIntDefault(r.URL.Query().Get("http"), 0)
@@ -242,15 +281,15 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64
 
 	s.mu.Lock()
 	if old, ok := s.nodes[nodeID]; ok {
-		_ = old.conn.conn.Close()
-		delete(s.byConn, old.conn.conn)
+		_ = old.conn.Close()
+		delete(s.byConn, old.conn)
 	}
 	// 初始化 AES 加密器并缓存（仅创建一次）
 	var nodeCrypto *security.AESCrypto
 	if strings.TrimSpace(secret) != "" {
 		nodeCrypto, _ = security.NewAESCrypto(secret)
 	}
-	ns := &nodeSession{nodeID: nodeID, secret: secret, conn: cw, crypto: nodeCrypto}
+	ns := &nodeSession{nodeID: nodeID, secret: secret, conn: conn, crypto: nodeCrypto}
 	s.nodes[nodeID] = ns
 	s.byConn[conn] = ns
 	s.mu.Unlock()
@@ -270,7 +309,7 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64
 		needOfflineBroadcast := false
 		s.mu.Lock()
 		current, ok := s.nodes[nodeID]
-		if ok && current.conn.conn == conn {
+		if ok && current.conn == conn {
 			delete(s.nodes, nodeID)
 			needOfflineBroadcast = true
 		}
@@ -400,7 +439,7 @@ func (s *Server) SendCommand(nodeID int64, cmdType string, data interface{}, tim
 	s.mu.RLock()
 	ns, ok := s.nodes[nodeID]
 	s.mu.RUnlock()
-	if !ok || ns == nil || ns.conn == nil || ns.conn.conn == nil {
+	if !ok || ns == nil || ns.conn == nil {
 		return CommandResult{}, errors.New("节点不在线")
 	}
 
@@ -450,11 +489,9 @@ func (s *Server) SendCommand(nodeID int64, cmdType string, data interface{}, tim
 		}
 	}
 
-	ns.conn.mu.Lock()
-	_ = ns.conn.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	err = ns.conn.conn.WriteMessage(websocket.TextMessage, messageData)
-	_ = ns.conn.conn.SetWriteDeadline(time.Time{})
-	ns.conn.mu.Unlock()
+	_ = ns.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	err = ns.conn.WriteMessage(websocket.TextMessage, messageData)
+	_ = ns.conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		cleanup()
 		return CommandResult{}, err
@@ -570,38 +607,51 @@ func (s *Server) broadcastStatus(nodeID int64, status int) {
 		"data": status,
 	}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
 func (s *Server) broadcastInfo(nodeID int64, data string) {
 	payload := broadcastMessage{ID: nodeID, Type: "info", Data: data}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
 func (s *Server) broadcastTyped(nodeID int64, msgType string, data string) {
 	payload := broadcastMessage{ID: nodeID, Type: msgType, Data: data}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
-func (s *Server) broadcastToAdmins(message string) {
+func (s *Server) broadcastToRealtime(message string) {
 	s.mu.RLock()
 	admins := make([]*adminSession, 0, len(s.admins))
 	for c := range s.admins {
 		admins = append(admins, c)
 	}
+	monitors := make([]*monitorSession, 0, len(s.monitors))
+	for c := range s.monitors {
+		monitors = append(monitors, c)
+	}
 	s.mu.RUnlock()
 
 	for _, c := range admins {
-		if c == nil || c.conn == nil || c.conn.conn == nil {
+		if c == nil || c.conn == nil {
 			continue
 		}
-		c.conn.mu.Lock()
-		_ = c.conn.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-		err := c.conn.conn.WriteMessage(websocket.TextMessage, []byte(message))
-		_ = c.conn.conn.SetWriteDeadline(time.Time{})
-		c.conn.mu.Unlock()
+		_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		err := c.conn.WriteMessage(websocket.TextMessage, []byte(message))
+		_ = c.conn.SetWriteDeadline(time.Time{})
+		if err != nil {
+			log.Printf("websocket broadcast failed: %v", err)
+		}
+	}
+	for _, c := range monitors {
+		if c == nil || c.conn == nil {
+			continue
+		}
+		_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		err := c.conn.WriteMessage(websocket.TextMessage, []byte(message))
+		_ = c.conn.SetWriteDeadline(time.Time{})
 		if err != nil {
 			log.Printf("websocket broadcast failed: %v", err)
 		}
@@ -655,8 +705,31 @@ func (s *Server) validateAdminSession(userID int64, claims auth.Claims) bool {
 	return true
 }
 
-func startKeepalive(cw *connWrap, done <-chan struct{}, validate func() bool) {
-	if cw == nil || cw.conn == nil {
+func (s *Server) validateMonitorSession(userID int64, claims auth.Claims) bool {
+	if s == nil {
+		return false
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if s.getUserAuthState != nil {
+		state, err := s.getUserAuthState(userID)
+		if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || claims.IatMs <= state.PasswordChangedAt {
+			return false
+		}
+	}
+	if s.repo == nil {
+		return false
+	}
+	allowed, err := s.repo.HasMonitorPermission(userID)
+	if err != nil || !allowed {
+		return false
+	}
+	return true
+}
+
+func startKeepalive(conn *websocket.Conn, done <-chan struct{}, validate func() bool) {
+	if conn == nil {
 		return
 	}
 	ticker := time.NewTicker(wsPingPeriod)
@@ -668,16 +741,14 @@ func startKeepalive(cw *connWrap, done <-chan struct{}, validate func() bool) {
 			return
 		case <-ticker.C:
 			if validate != nil && !validate() {
-				_ = cw.conn.Close()
+				_ = conn.Close()
 				return
 			}
-			cw.mu.Lock()
-			_ = cw.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-			err := cw.conn.WriteMessage(websocket.PingMessage, nil)
-			_ = cw.conn.SetWriteDeadline(time.Time{})
-			cw.mu.Unlock()
+			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			_ = conn.SetWriteDeadline(time.Time{})
 			if err != nil {
-				_ = cw.conn.Close()
+				_ = conn.Close()
 				return
 			}
 		}

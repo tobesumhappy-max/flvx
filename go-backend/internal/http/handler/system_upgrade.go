@@ -31,6 +31,10 @@ const (
 var safeBackendContainerPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var enableIPv6ComposePattern = regexp.MustCompile(`(?im)^\s*enable_ipv6\s*:\s*['"]?true['"]?\s*(?:#.*)?$`)
 var systemUpgradeReleaseBaseURL = githubHTMLBase
+var systemUpgradeAPIBaseURL = githubAPIBase
+var systemUpgradeHTTPGet = func(client *http.Client, url string) (*http.Response, error) {
+	return client.Get(url)
+}
 
 type systemUpgradeExecutor struct {
 	deployDir        string
@@ -199,7 +203,7 @@ if [ ! -f .env ]; then
 fi
 
 log "拉取新镜像..."
-if ! docker compose pull backend frontend 2>&1 | tee -a "$LOGFILE"; then
+if ! docker compose pull backend frontend >> "$LOGFILE" 2>&1; then
   log "错误: 拉取镜像失败"
   exit 1
 fi
@@ -208,7 +212,7 @@ log "等待旧容器释放资源..."
 sleep 3
 
 log "重启服务（force-recreate）..."
-if ! docker compose up -d --force-recreate --remove-orphans backend frontend 2>&1 | tee -a "$LOGFILE"; then
+if ! docker compose up -d --force-recreate --remove-orphans backend frontend >> "$LOGFILE" 2>&1; then
   log "错误: 重启服务失败"
   exit 1
 fi
@@ -317,6 +321,68 @@ func (e *systemUpgradeExecutor) replaceCompose(path string, data []byte) error {
 	return writeFileWithMode(path, data, mode)
 }
 
+func (h *Handler) buildSystemUpgradeDownloadURL(version, filename string) string {
+	enabled, proxyURL := h.getGithubProxyConfig()
+	base := fmt.Sprintf("%s/%s/releases/download/%s/%s", strings.TrimRight(systemUpgradeReleaseBaseURL, "/"), githubRepo, version, filename)
+	if enabled {
+		return fmt.Sprintf("%s/%s", proxyURL, base)
+	}
+	return base
+}
+
+func (h *Handler) fetchSystemUpgradeReleases(perPage int) ([]githubRelease, error) {
+	if perPage <= 0 {
+		perPage = 20
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	url := fmt.Sprintf("%s/repos/%s/releases?per_page=%d", strings.TrimRight(systemUpgradeAPIBaseURL, "/"), githubRepo, perPage)
+	if enabled, proxyURL := h.getGithubProxyConfig(); enabled {
+		url = fmt.Sprintf("%s/%s", proxyURL, url)
+	}
+
+	resp, err := systemUpgradeHTTPGet(client, url)
+	if err != nil {
+		return nil, fmt.Errorf("请求GitHub API失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("GitHub API返回 %d: %s", resp.StatusCode, string(body))
+	}
+
+	var releases []githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("解析GitHub API响应失败: %v", err)
+	}
+
+	return releases, nil
+}
+
+func (h *Handler) resolveSystemUpgradeLatestReleaseByChannel(channel string) (string, error) {
+	normalizedChannel := normalizeReleaseChannel(channel)
+	releases, err := h.fetchSystemUpgradeReleases(50)
+	if err != nil {
+		return "", err
+	}
+
+	for _, r := range releases {
+		if r.Draft {
+			continue
+		}
+		tag := strings.TrimSpace(r.TagName)
+		if tag == "" {
+			continue
+		}
+		if releaseChannelFromTag(tag) == normalizedChannel {
+			return tag, nil
+		}
+	}
+
+	return "", fmt.Errorf("未找到%s版本号", releaseChannelLabel(normalizedChannel))
+}
+
 func fileModeOrDefault(path string, fallback os.FileMode) (os.FileMode, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -367,9 +433,9 @@ func (e *systemUpgradeExecutor) startHelper(ctx context.Context, imageID, helper
 }
 
 func (h *Handler) downloadReleaseAsset(version, filename string) ([]byte, error) {
-	url := fmt.Sprintf("%s/%s/releases/download/%s/%s", strings.TrimRight(systemUpgradeReleaseBaseURL, "/"), githubRepo, version, filename)
+	url := h.buildSystemUpgradeDownloadURL(version, filename)
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := systemUpgradeHTTPGet(client, url)
 	if err != nil {
 		return nil, fmt.Errorf("下载%s失败: %v", filename, err)
 	}
@@ -457,7 +523,7 @@ func (h *Handler) systemVersion(w http.ResponseWriter, r *http.Request) {
 	current := currentPanelVersion()
 	exec := newSystemUpgradeExecutor()
 	capability := exec.capability(r.Context())
-	latest, err := resolveLatestReleaseByChannel(channel)
+	latest, err := h.resolveSystemUpgradeLatestReleaseByChannel(channel)
 	response.WriteJSON(w, response.OK(systemUpgradeVersionResponse(current, channel, latest, err, capability)))
 }
 
@@ -477,7 +543,7 @@ func (h *Handler) systemCheckUpdates(w http.ResponseWriter, r *http.Request) {
 	exec := newSystemUpgradeExecutor()
 	capability := exec.capability(r.Context())
 
-	githubReleases, err := fetchGitHubReleases(50)
+	githubReleases, err := h.fetchSystemUpgradeReleases(50)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, fmt.Sprintf("获取版本列表失败: %v", err)))
 		return
@@ -514,21 +580,20 @@ func (h *Handler) systemUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	channel := normalizeReleaseChannel(req.Channel)
-	version := strings.TrimSpace(req.Version)
-	if version == "" {
-		var err error
-		version, err = resolveLatestReleaseByChannel(channel)
-		if err != nil {
-			response.WriteJSON(w, response.Err(-2, fmt.Sprintf("获取最新%s失败: %v", releaseChannelLabel(channel), err)))
-			return
-		}
-	}
-
 	exec := newSystemUpgradeExecutor()
 	capability := exec.capability(r.Context())
 	if !capability.Capable {
 		response.WriteJSON(w, response.ErrDefault("当前环境不支持面板自升级: "+strings.Join(capability.Reasons, "; ")))
 		return
+	}
+	version := strings.TrimSpace(req.Version)
+	if version == "" {
+		var err error
+		version, err = h.resolveSystemUpgradeLatestReleaseByChannel(channel)
+		if err != nil {
+			response.WriteJSON(w, response.Err(-2, fmt.Sprintf("获取最新%s失败: %v", releaseChannelLabel(channel), err)))
+			return
+		}
 	}
 	imageID, err := exec.currentBackendImage(r.Context())
 	if err != nil {

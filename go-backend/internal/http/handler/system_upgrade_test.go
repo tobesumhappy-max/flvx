@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"go-backend/internal/store/repo"
 )
 
 func TestSelectComposeAssetUsesIPv6Template(t *testing.T) {
@@ -21,19 +25,39 @@ func TestSelectComposeAssetUsesIPv6Template(t *testing.T) {
 	}
 }
 
-func TestDownloadReleaseAssetUsesDirectReleaseURL(t *testing.T) {
-	var gotPath string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		_, _ = w.Write([]byte("services:\n  backend:\n    image: test\n"))
-	}))
-	defer server.Close()
+func TestDownloadReleaseAssetUsesGithubProxyWhenEnabled(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	repoStore, err := repo.Open(dbPath)
+	if err != nil {
+		t.Fatalf("repo.Open() error = %v", err)
+	}
+	defer repoStore.Close()
 
+	h := &Handler{repo: repoStore}
 	originalBase := systemUpgradeReleaseBaseURL
-	systemUpgradeReleaseBaseURL = server.URL
+	systemUpgradeReleaseBaseURL = "https://example.invalid"
 	t.Cleanup(func() { systemUpgradeReleaseBaseURL = originalBase })
 
-	h := &Handler{}
+	originalGet := systemUpgradeHTTPGet
+	defer func() { systemUpgradeHTTPGet = originalGet }()
+
+	var gotURL string
+	systemUpgradeHTTPGet = func(client *http.Client, url string) (*http.Response, error) {
+		gotURL = url
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("services:\n  backend:\n    image: test\n")),
+		}, nil
+	}
+
+	now := time.Now().UnixMilli()
+	if err := repoStore.UpsertConfig("github_proxy_enabled", "true", now); err != nil {
+		t.Fatalf("UpsertConfig() github_proxy_enabled error = %v", err)
+	}
+	if err := repoStore.UpsertConfig("github_proxy_url", "https://proxy.example.com", now); err != nil {
+		t.Fatalf("UpsertConfig() github_proxy_url error = %v", err)
+	}
+
 	data, err := h.downloadReleaseAsset("2.1.9", "docker-compose-v4.yml")
 	if err != nil {
 		t.Fatalf("downloadReleaseAsset() error = %v", err)
@@ -42,24 +66,39 @@ func TestDownloadReleaseAssetUsesDirectReleaseURL(t *testing.T) {
 		t.Fatalf("downloadReleaseAsset() data = %q, want compose data", string(data))
 	}
 
-	wantPath := "/" + githubRepo + "/releases/download/2.1.9/docker-compose-v4.yml"
-	if gotPath != wantPath {
-		t.Fatalf("download path = %q, want %q", gotPath, wantPath)
+	wantURL := "https://proxy.example.com/https://example.invalid/Sagit-chu/flvx/releases/download/2.1.9/docker-compose-v4.yml"
+	if gotURL != wantURL {
+		t.Fatalf("download URL = %q, want %q", gotURL, wantURL)
 	}
 }
 
 func TestDownloadReleaseAssetRejectsOversizedBody(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(bytes.Repeat([]byte("a"), maxSystemUpgradeComposeAssetBytes+1))
-	}))
-	defer server.Close()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	repoStore, err := repo.Open(dbPath)
+	if err != nil {
+		t.Fatalf("repo.Open() error = %v", err)
+	}
+	defer repoStore.Close()
+	now := time.Now().UnixMilli()
+	if err := repoStore.UpsertConfig("github_proxy_enabled", "false", now); err != nil {
+		t.Fatalf("UpsertConfig() github_proxy_enabled error = %v", err)
+	}
 
 	originalBase := systemUpgradeReleaseBaseURL
-	systemUpgradeReleaseBaseURL = server.URL
+	systemUpgradeReleaseBaseURL = "https://example.invalid"
 	t.Cleanup(func() { systemUpgradeReleaseBaseURL = originalBase })
 
-	h := &Handler{}
-	_, err := h.downloadReleaseAsset("2.1.9", "docker-compose-v4.yml")
+	originalGet := systemUpgradeHTTPGet
+	defer func() { systemUpgradeHTTPGet = originalGet }()
+	systemUpgradeHTTPGet = func(client *http.Client, url string) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), maxSystemUpgradeComposeAssetBytes+1))),
+		}, nil
+	}
+
+	h := &Handler{repo: repoStore}
+	_, err = h.downloadReleaseAsset("2.1.9", "docker-compose-v4.yml")
 	if err == nil || !strings.Contains(err.Error(), "过大") {
 		t.Fatalf("downloadReleaseAsset() error = %v, want oversized error", err)
 	}
@@ -272,7 +311,7 @@ func TestSystemUpgradeFailsFastBeforeMutatingFiles(t *testing.T) {
 
 	fakeDockerDir := t.TempDir()
 	fakeDockerPath := filepath.Join(fakeDockerDir, "docker")
-	fakeDockerScript := "#!/bin/sh\ncase \"$1\" in\n  --version)\n    echo 'Docker version 27.0.0'\n    exit 0\n    ;;\n  compose)\n    if [ \"$2\" = version ]; then\n      echo 'Docker Compose version v2.33.0'\n      exit 0\n    fi\n    exit 0\n    ;;\n  inspect)\n    echo 'No such object: flux-panel-backend' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\n esac\n"
+	fakeDockerScript := "#!/bin/sh\ncase \"$1\" in\n  --version)\n    echo 'Docker version 27.0.0'\n    exit 0\n    ;;&\n  compose)\n    if [ \"$2\" = version ]; then\n      echo 'Docker Compose version v2.33.0'\n      exit 0\n    fi\n    exit 0\n    ;;&\n  inspect)\n    echo 'No such object: flux-panel-backend' >&2\n    exit 1\n    ;;&\n  *)\n    exit 0\n    ;;&\n esac\n"
 	if err := os.WriteFile(fakeDockerPath, []byte(fakeDockerScript), 0o755); err != nil {
 		t.Fatalf("WriteFile() fake docker error = %v", err)
 	}
@@ -281,7 +320,7 @@ func TestSystemUpgradeFailsFastBeforeMutatingFiles(t *testing.T) {
 	t.Setenv(panelBackendContainerEnv, "flux-panel-backend")
 
 	h := &Handler{}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade", strings.NewReader(`{"channel":"stable","version":"3.0.0"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade", strings.NewReader(`{"channel":"stable"}`))
 	rr := httptest.NewRecorder()
 
 	h.systemUpgrade(rr, req)
