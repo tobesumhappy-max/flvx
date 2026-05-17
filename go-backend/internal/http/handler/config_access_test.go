@@ -67,7 +67,22 @@ func TestConfigGetRejectsSensitiveKeysWithoutAuth(t *testing.T) {
 	assertHandlerCodeMsg(t, resp, 403, "禁止访问敏感配置")
 }
 
-func TestConfigUpdateRejectsSensitiveKeys(t *testing.T) {
+func TestConfigGetAllowsSensitiveKeysForAdmin(t *testing.T) {
+	router, r := setupConfigAccessTestRouter(t)
+	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
+	seedConfigValue(t, r, "jwt_secret", "jwt-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/get", bytes.NewBufferString(`{"name":"jwt_secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", adminToken)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	assertHandlerConfigValue(t, resp, "jwt_secret", "jwt-secret")
+}
+
+func TestConfigUpdateAllowsSensitiveKeysForAdmin(t *testing.T) {
 	router, _ := setupConfigAccessTestRouter(t)
 	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
 
@@ -78,10 +93,10 @@ func TestConfigUpdateRejectsSensitiveKeys(t *testing.T) {
 
 	router.ServeHTTP(resp, req)
 
-	assertHandlerCodeMsg(t, resp, 403, "禁止访问敏感配置")
+	assertHandlerCode(t, resp, 0)
 }
 
-func TestConfigUpdateSingleRejectsSensitiveKeys(t *testing.T) {
+func TestConfigUpdateSingleAllowsSensitiveKeysForAdmin(t *testing.T) {
 	router, _ := setupConfigAccessTestRouter(t)
 	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
 
@@ -92,7 +107,95 @@ func TestConfigUpdateSingleRejectsSensitiveKeys(t *testing.T) {
 
 	router.ServeHTTP(resp, req)
 
-	assertHandlerCodeMsg(t, resp, 403, "禁止访问敏感配置")
+	assertHandlerCode(t, resp, 0)
+}
+
+func TestConfigUpdateAllowsCloudflareSecretKeyWrite(t *testing.T) {
+	router, r := setupConfigAccessTestRouter(t)
+	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/update", bytes.NewBufferString(`{"cloudflare_secret_key":"turnstile-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", adminToken)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	assertHandlerCode(t, resp, 0)
+
+	cfg, err := r.GetConfigByName("cloudflare_secret_key")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if cfg == nil || cfg.Value != "turnstile-secret" {
+		t.Fatalf("expected cloudflare_secret_key to be updated, got %#v", cfg)
+	}
+}
+
+func TestConfigUpdateSingleAllowsCloudflareSecretKeyWrite(t *testing.T) {
+	router, r := setupConfigAccessTestRouter(t)
+	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/update-single", bytes.NewBufferString(`{"name":"cloudflare_secret_key","value":"turnstile-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", adminToken)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	assertHandlerCode(t, resp, 0)
+
+	cfg, err := r.GetConfigByName("cloudflare_secret_key")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if cfg == nil || cfg.Value != "turnstile-secret" {
+		t.Fatalf("expected cloudflare_secret_key to be updated, got %#v", cfg)
+	}
+}
+
+func TestConfigUpdateAllowsLicenseKeyWrite(t *testing.T) {
+	router, r := setupConfigAccessTestRouter(t)
+	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/update", bytes.NewBufferString(`{"license_key":"license-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", adminToken)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	assertHandlerCode(t, resp, 0)
+
+	cfg, err := r.GetConfigByName("license_key")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if cfg == nil || cfg.Value != "license-secret" {
+		t.Fatalf("expected license_key to be updated, got %#v", cfg)
+	}
+}
+
+func TestConfigUpdateSingleAllowsLicenseKeyWrite(t *testing.T) {
+	router, r := setupConfigAccessTestRouter(t)
+	adminToken := mustGenerateConfigAccessToken(t, 1, "admin_user", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/update-single", bytes.NewBufferString(`{"name":"license_key","value":"license-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", adminToken)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	assertHandlerCode(t, resp, 0)
+
+	cfg, err := r.GetConfigByName("license_key")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if cfg == nil || cfg.Value != "license-secret" {
+		t.Fatalf("expected license_key to be updated, got %#v", cfg)
+	}
 }
 
 func setupConfigAccessTestRouter(t *testing.T) (http.Handler, *repo.Repository) {

@@ -393,8 +393,7 @@ func (h *Handler) getConfigByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	configName := strings.ToLower(strings.TrimSpace(req.Name))
-	switch configName {
-	case "license_key", "cloudflare_secret_key", "jwt_secret":
+	if repo.IsSensitiveConfigKey(configName) && !isAdminRequest(r) {
 		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
 		return
 	}
@@ -989,7 +988,7 @@ func (h *Handler) updateConfigs(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			continue
 		}
-		if repo.IsSensitiveConfigKey(key) {
+		if repo.IsSensitiveConfigKey(key) && !isAdminRequest(r) {
 			response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
 			return
 		}
@@ -1030,7 +1029,7 @@ func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
 		return
 	}
-	if repo.IsSensitiveConfigKey(name) {
+	if repo.IsSensitiveConfigKey(name) && !isAdminRequest(r) {
 		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
 		return
 	}
@@ -1058,6 +1057,14 @@ func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.WriteJSON(w, response.OKEmpty())
+}
+
+func isAdminRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	return ok && claims.RoleID == 0
 }
 
 func normalizeAndValidateConfigValue(key, value string) (string, error) {
